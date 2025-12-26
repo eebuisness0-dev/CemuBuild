@@ -9,7 +9,6 @@ on:
       next_version_minor:
         required: false
         type: string
-      workflow_dispatch:
 
 env:
   VCPKG_ROOT: "${{github.workspace}}/dependencies/vcpkg"
