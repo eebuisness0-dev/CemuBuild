@@ -25,7 +25,10 @@
     "boost-property-tree",
     "boost-static-string",
     "boost-random",
-    "fmt",
+    {
+      "name": "fmt",
+      "version>=": "12.1.0"
+    },
     "hidapi",
     "libpng",
     "glm",
@@ -65,7 +68,7 @@
     },
     {
       "name": "sdl2",
-      "version": "2.32.8"
+      "version": "2.32.10"
     },
     {
       "name": "wxwidgets",
