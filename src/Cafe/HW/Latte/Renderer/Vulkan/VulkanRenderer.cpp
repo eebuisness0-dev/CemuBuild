@@ -336,6 +336,136 @@ void VulkanRenderer::GetDeviceFeatures()
 	cemuLog_log(LogType::Force, fmt::format("VulkanLimits: UBAlignment {0} nonCoherentAtomSize {1}", prop2.properties.limits.minUniformBufferOffsetAlignment, prop2.properties.limits.nonCoherentAtomSize));
 }
 
+#if BOOST_OS_LINUX
+#include <sys/wait.h>
+#include "resource/IconsFontAwesome5.h"
+
+int BreathOfTheWildChildProcessMain()
+{
+	InitializeGlobalVulkan();
+	struct sigaction sa{};
+	sa.sa_handler = [](int unused) { _exit(1); };
+
+	int ret = sigaction(SIGABRT, &sa, nullptr);
+
+	freopen("/dev/null", "w", stderr);
+
+	setenv("RADV_DEBUG", "llvm", 1);
+
+	VkInstanceCreateInfo create_info{};
+	create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	VkInstance instance = VK_NULL_HANDLE;
+	if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS)
+		return 1;
+	InitializeInstanceVulkan(instance);
+
+	// this function will abort() when LLVM is absent
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(instance, &count, nullptr);
+
+	vkDestroyInstance(instance, nullptr);
+	return 0;
+}
+
+static void LinuxBreathOfTheWildWorkaround(VkInstance& instance, const VkInstanceCreateInfo* create_info)
+{
+
+	// if the user specified either shader backend, do nothing.
+	// should parse the flag list but there are currently no other flags containing llvm or aco as a substring
+	const char* debugEnvC = getenv("RADV_DEBUG");
+	std::string_view debugEnv = debugEnvC != nullptr ? debugEnvC : "";
+	if (debugEnv.find("aco") != std::string_view::npos || debugEnv.find("llvm") != std::string_view::npos)
+		return;
+
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(instance, &count, nullptr);
+
+	std::vector<VkPhysicalDevice> physicalDevices{count};
+	vkEnumeratePhysicalDevices(instance, &count, physicalDevices.data());
+
+	// Find the first AMD device using a RADV driver and store its version
+	int version = 0;
+	for (auto& i : physicalDevices)
+	{
+		VkPhysicalDeviceDriverProperties driverProps{};
+		driverProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+		VkPhysicalDeviceProperties2 prop{};
+		prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+		prop.pNext = &driverProps;
+		vkGetPhysicalDeviceProperties2(i, &prop);
+		if (prop.properties.vendorID != 0x1002 || driverProps.driverID != VK_DRIVER_ID_MESA_RADV)
+			continue;
+
+		version = prop.properties.driverVersion;
+		break;
+	}
+
+	if (version == 0)
+		return;
+
+
+	int major = VK_API_VERSION_MAJOR(version);
+	int minor = VK_API_VERSION_MINOR(version);
+	int patch = VK_API_VERSION_PATCH(version);
+
+	// If the driver is unaffected skip the workaround.
+	// affected drivers:
+	// 25.3.0 - 26.0.4
+	if ((major <= 25 && minor < 3) || (major == 26 && (minor > 0 || patch >= 5)) || major > 26)
+		return;
+
+	// check if running with LLVM would crash because mesa is LLVM-less.
+	int childID = fork();
+	if (childID == 0) // inside this if statement runs in child
+	{
+		setenv("CEMU_DETECT_RADV","1", 1);
+		execl("/proc/self/exe", "/proc/self/exe", nullptr);
+		_exit(2); // exec failed so err on the safe side and signal failure
+	}
+
+	int childStatus = 0;
+	waitpid(childID,  &childStatus, 0);
+
+	// if the process didn't exit cleanly or failed to determine LLVM status
+	if (!WIFEXITED(childStatus) || WEXITSTATUS(childStatus) == 2)
+	{
+		cemuLog_log(LogType::Force, "BOTW/RADV workaround not applied because detecting LLVM presence failed unexpectedly");
+		return;
+	}
+
+	if (WEXITSTATUS(childStatus) == 1)
+		cemuLog_log(LogType::Force, "BOTW/RADV workaround not applied because mesa was built without LLVM");
+
+	// only continue if the process exits with code zero, which means it didn't crash
+	if (WEXITSTATUS(childStatus) != 0)
+		return;
+
+	cemuLog_log(LogType::Force, "BOTW/RADV workaround active. Adding \"llvm\" to RADV_DEBUG environment variable");
+	if (debugEnv.empty())
+	{
+		setenv("RADV_DEBUG", "llvm", 1);
+	}
+	else
+	{
+		std::string appendedDebugEnv{debugEnv};
+		appendedDebugEnv.append(",llvm");
+		setenv("RADV_DEBUG", appendedDebugEnv.c_str(), 1);
+	}
+
+	// recreate the vulkan instance to update debug setting
+	vkDestroyInstance(instance, nullptr);
+	VkResult err = vkCreateInstance(create_info, nullptr, &instance);
+	// re-check for errors just in case.
+	if (err != VK_SUCCESS)
+		throw std::runtime_error(fmt::format("Unable to re-create a Vulkan instance after RADV/LLVM workaround: {}", err));
+	InitializeInstanceVulkan(instance);
+
+	LatteOverlay_pushNotification(std::string{(const char*)ICON_FA_EXCLAMATION_TRIANGLE} + "RADV_DEBUG=llvm set automatically to avoid crashing due to a driver bug. If possible update mesa to 26.0.5 or newer", 10'000);
+
+}
+
+#endif
+
 VulkanRenderer::VulkanRenderer()
 {
 	glslang::InitializeProcess();
@@ -394,6 +524,15 @@ VulkanRenderer::VulkanRenderer()
 
 	if (!InitializeInstanceVulkan(m_instance))
 		throw std::runtime_error("Unable to load instanced Vulkan functions");
+
+	// Workaround for BOTW + RADV. Runes like Magnesis and the camera cause GPU crashes.
+#if BOOST_OS_LINUX
+	uint64 currentTitleId = CafeSystem::GetForegroundTitleId();
+	if (currentTitleId == 0x00050000101c9500 || currentTitleId == 0x00050000101c9400 || currentTitleId == 0x00050000101c9300)
+	{
+		LinuxBreathOfTheWildWorkaround(m_instance, &create_info);
+	}
+#endif
 
 	uint32_t device_count = 0;
 	vkEnumeratePhysicalDevices(m_instance, &device_count, nullptr);
@@ -475,12 +614,21 @@ VulkanRenderer::VulkanRenderer()
 	std::set<int> uniqueQueueFamilies = { m_indices.graphicsFamily, m_indices.presentFamily };
 	std::vector<VkDeviceQueueCreateInfo> queueCreateInfos = CreateQueueCreateInfos(uniqueQueueFamilies);
 	VkPhysicalDeviceFeatures deviceFeatures = {};
+	VkPhysicalDeviceFeatures2 deviceFeatures2 = {};
+	deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	vkGetPhysicalDeviceFeatures2(m_physicalDevice, &deviceFeatures2);
 
 	deviceFeatures.independentBlend = VK_TRUE;
 	deviceFeatures.samplerAnisotropy = VK_TRUE;
 	deviceFeatures.imageCubeArray = VK_TRUE;
 	//moltenVK supports logicOp via private api
-	deviceFeatures.logicOp = VK_TRUE;
+	deviceFeatures.logicOp = deviceFeatures2.features.logicOp;
+	if (!deviceFeatures.logicOp) {
+		cemuLog_log(LogType::Force, "LogicOp not supported by the driver, some rendering issues might occur");
+#if BOOST_OS_MACOS
+		cemuLog_log(LogType::Force, "Install the privateapi variant of MoltenVK to get logicOp support on macOS");
+#endif
+	}
 #if !BOOST_OS_MACOS
 	deviceFeatures.geometryShader = VK_TRUE;
 #endif
@@ -498,10 +646,7 @@ VulkanRenderer::VulkanRenderer()
 		deviceFeatures.robustBufferAccess = VK_TRUE;
 	}
 
-	if (m_featureControl.mode.useTFEmulationViaSSBO)
-	{
-		deviceFeatures.vertexPipelineStoresAndAtomics = true;
-	}
+	deviceFeatures.vertexPipelineStoresAndAtomics = true;
 
 	void* deviceExtensionFeatures = nullptr;
 
@@ -639,7 +784,8 @@ VulkanRenderer::VulkanRenderer()
 	m_textureReadbackBufferPtr = (uint8*)bufferPtr;
 
 	// transform feedback ringbuffer
-	memoryManager->CreateBuffer(LatteStreamout_GetRingBufferSize(), VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | (m_featureControl.mode.useTFEmulationViaSSBO ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0), 0, m_xfbRingBuffer, m_xfbRingBufferMemory);
+	VkBufferUsageFlags xfbRingBufferUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	memoryManager->CreateBuffer(LatteStreamout_GetRingBufferSize(), xfbRingBufferUsage, 0, m_xfbRingBuffer, m_xfbRingBufferMemory);
 
 	// occlusion query result buffer
 	if (!memoryManager->CreateBuffer(OCCLUSION_QUERY_POOL_SIZE * sizeof(uint64), VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_occlusionQueries.bufferQueryResults, m_occlusionQueries.memoryQueryResults))
@@ -1219,7 +1365,6 @@ bool VulkanRenderer::CheckDeviceExtensionSupport(const VkPhysicalDevice device, 
 	}
 
 	info.deviceExtensions.tooling_info = isExtensionAvailable(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
-	info.deviceExtensions.transform_feedback = isExtensionAvailable(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
 	info.deviceExtensions.depth_range_unrestricted = isExtensionAvailable(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	info.deviceExtensions.nv_fill_rectangle = isExtensionAvailable(VK_NV_FILL_RECTANGLE_EXTENSION_NAME);
 	info.deviceExtensions.pipeline_feedback = isExtensionAvailable(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
@@ -3566,46 +3711,14 @@ void VulkanRenderer::streamout_setupXfbBuffer(uint32 bufferIndex, sint32 ringBuf
 
 void VulkanRenderer::streamout_begin()
 {
-	if (m_featureControl.mode.useTFEmulationViaSSBO)
-		return;
-	if (m_state.hasActiveXfb == false)
-		m_state.hasActiveXfb = true;
-}
-
-void VulkanRenderer::streamout_applyTransformFeedbackState()
-{
-	if (m_featureControl.mode.useTFEmulationViaSSBO)
-		return;
-	cemu_assert_debug(m_state.hasActiveXfb == false);
-	if (m_state.hasActiveXfb)
-	{
-		// set buffers
-		for (sint32 i = 0; i < LATTE_NUM_STREAMOUT_BUFFER; i++)
-		{
-			if (m_streamoutState.buffer[i].enabled)
-			{
-				VkBuffer tfBuffer = m_xfbRingBuffer;
-				VkDeviceSize tfBufferOffset = m_streamoutState.buffer[i].ringBufferOffset;
-				VkDeviceSize tfBufferSize = VK_WHOLE_SIZE;
-				vkCmdBindTransformFeedbackBuffersEXT(m_state.currentCommandBuffer, i, 1, &tfBuffer, &tfBufferOffset, &tfBufferSize);
-			}
-		}
-		// begin transform feedback
-		vkCmdBeginTransformFeedbackEXT(m_state.currentCommandBuffer, 0, 0, nullptr, nullptr);
-	}
 }
 
 void VulkanRenderer::streamout_rendererFinishDrawcall()
 {
-	if (m_state.hasActiveXfb)
-	{
-		vkCmdEndTransformFeedbackEXT(m_state.currentCommandBuffer, 0, 0, nullptr, nullptr);
-		m_streamoutState.buffer[0].enabled = false;
-		m_streamoutState.buffer[1].enabled = false;
-		m_streamoutState.buffer[2].enabled = false;
-		m_streamoutState.buffer[3].enabled = false;
-		m_state.hasActiveXfb = false;
-	}
+	m_streamoutState.buffer[0].enabled = false;
+	m_streamoutState.buffer[1].enabled = false;
+	m_streamoutState.buffer[2].enabled = false;
+	m_streamoutState.buffer[3].enabled = false;
 }
 
 
